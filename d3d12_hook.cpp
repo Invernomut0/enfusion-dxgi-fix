@@ -66,6 +66,7 @@ __CRT_UUID_DECL(ID3D12Device5,              0x8b4f173b,0x2fea,0x4b80,0x8f,0x58,0
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
+#include <atomic>
 
 // IID_PPV_ARGS - defined in objbase.h on MSVC, may be missing on mingw
 #ifndef IID_PPV_ARGS
@@ -550,6 +551,13 @@ static void TranslateCopyTiles(
 
 // ============================================================================
 // CommandListWrapper
+// Private IID used to detect and unwrap CommandListWrapper objects.
+// {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+static const GUID IID_CommandListWrapperMarker = {
+    0xa1b2c3d4, 0xe5f6, 0x7890,
+    { 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90 }
+};
+
 // Wraps ID3D12GraphicsCommandList through ID3D12GraphicsCommandList4
 // ============================================================================
 
@@ -654,6 +662,10 @@ public:
         UINT VertexCountPerInstance, UINT InstanceCount,
         UINT StartVertexLocation,   UINT StartInstanceLocation) override
     {
+        static std::atomic<uint64_t> s_draws{0};
+        uint64_t n = s_draws.fetch_add(1);
+        if (n == 0) D3DLog("First DrawInstanced: verts=%u instances=%u", VertexCountPerInstance, InstanceCount);
+        if (n == 1000) D3DLog("1000 DrawInstanced calls reached");
         m_real->DrawInstanced(VertexCountPerInstance, InstanceCount,
                               StartVertexLocation, StartInstanceLocation);
     }
@@ -663,6 +675,10 @@ public:
         UINT StartIndexLocation,    INT  BaseVertexLocation,
         UINT StartInstanceLocation) override
     {
+        static std::atomic<uint64_t> s_draws{0};
+        uint64_t n = s_draws.fetch_add(1);
+        if (n == 0) D3DLog("First DrawIndexedInstanced: idx=%u instances=%u", IndexCountPerInstance, InstanceCount);
+        if (n == 1000) D3DLog("1000 DrawIndexedInstanced calls reached");
         m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount,
                                      StartIndexLocation, BaseVertexLocation,
                                      StartInstanceLocation);
@@ -769,37 +785,48 @@ public:
         m_real->SetPipelineState(pPipelineState);
     }
 
-    // *** KEY OVERRIDE #2: ResourceBarrier → filter ALIASING (TiledResourceBarrier) ***
+    // *** KEY OVERRIDE #2: ResourceBarrier — handle ALIASING barriers ***
     void STDMETHODCALLTYPE ResourceBarrier(
         UINT                          NumBarriers,
         const D3D12_RESOURCE_BARRIER* pBarriers) override
     {
-        // D3D12_RESOURCE_BARRIER_TYPE_ALIASING is used for tiled resource transitions.
-        // D3DMetal logs these as "TiledResourceBarrier unsupported" and no-ops them,
-        // leaving the GPU in an inconsistent state. We filter them before they arrive
-        // so D3DMetal never sees them.
-        std::vector<D3D12_RESOURCE_BARRIER> filtered;
-        filtered.reserve(NumBarriers);
-        UINT numFiltered = 0;
+        // DXMT no-ops D3D12_RESOURCE_BARRIER_TYPE_ALIASING. Replace each aliasing
+        // barrier with a UAV barrier (pResource=null = global UAV flush) so DXMT
+        // serializes all pending GPU writes before the caller reuses the memory.
+        // The aliasing barrier itself is dropped since DXMT ignores it anyway.
+        std::vector<D3D12_RESOURCE_BARRIER> out;
+        out.reserve(NumBarriers);
 
         for (UINT i = 0; i < NumBarriers; i++) {
             if (pBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
-                D3DLog("ResourceBarrier: filtered ALIASING (TiledResourceBarrier) "
-                       "before=%p after=%p",
-                       pBarriers[i].Aliasing.pResourceBefore,
-                       pBarriers[i].Aliasing.pResourceAfter);
-                numFiltered++;
-                continue;
+                ID3D12Resource* before = pBarriers[i].Aliasing.pResourceBefore;
+                ID3D12Resource* after  = pBarriers[i].Aliasing.pResourceAfter;
+                D3D12_RESOURCE_DESC db = {}, da = {};
+                if (before) before->GetDesc(&db);
+                if (after)  after->GetDesc(&da);
+                static std::atomic<int> aliasCount{0};
+                int n = aliasCount.fetch_add(1);
+                if (n < 500 && (db.Dimension == 1 || da.Dimension == 1 || (n % 50) == 0)) {
+                    D3DLog("Aliasing[%d]: before=%p dim=%u fmt=%u w=%llu h=%u  after=%p dim=%u fmt=%u w=%llu h=%u",
+                        n,
+                        (void*)before, (unsigned)db.Dimension, (unsigned)db.Format,
+                        (unsigned long long)db.Width, (unsigned)db.Height,
+                        (void*)after,  (unsigned)da.Dimension, (unsigned)da.Format,
+                        (unsigned long long)da.Width, (unsigned)da.Height);
+                }
+                // Replace with UAV null-barrier to serialize GPU writes
+                D3D12_RESOURCE_BARRIER uav = {};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                uav.UAV.pResource = nullptr;
+                out.push_back(uav);
+            } else {
+                out.push_back(pBarriers[i]);
             }
-            filtered.push_back(pBarriers[i]);
         }
 
-        if (numFiltered > 0 || NumBarriers > 0)
-            D3DLog("ResourceBarrier: total=%u filtered=%u passed=%u",
-                   NumBarriers, numFiltered, (UINT)filtered.size());
-
-        if (!filtered.empty())
-            m_real->ResourceBarrier((UINT)filtered.size(), filtered.data());
+        if (!out.empty())
+            m_real->ResourceBarrier((UINT)out.size(), out.data());
     }
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* pCommandList) override {
@@ -998,6 +1025,11 @@ public:
         ID3D12Resource* pArgumentBuffer, UINT64 ArgumentBufferOffset,
         ID3D12Resource* pCountBuffer,    UINT64 CountBufferOffset) override
     {
+        static std::atomic<uint64_t> s_indirect{0};
+        uint64_t n = s_indirect.fetch_add(1);
+        if (n == 0) D3DLog("First ExecuteIndirect: maxCount=%u argBuf=%p argOff=%llu",
+            MaxCommandCount, (void*)pArgumentBuffer, (unsigned long long)ArgumentBufferOffset);
+        if (n == 1000) D3DLog("1000 ExecuteIndirect calls reached");
         m_real->ExecuteIndirect(pCommandSignature, MaxCommandCount,
                                 pArgumentBuffer, ArgumentBufferOffset,
                                 pCountBuffer, CountBufferOffset);
@@ -1129,12 +1161,6 @@ public:
     }
 };
 
-// Private IID used to detect and unwrap CommandListWrapper objects.
-// {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
-static const GUID IID_CommandListWrapperMarker = {
-    0xa1b2c3d4, 0xe5f6, 0x7890,
-    { 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90 }
-};
 
 // ============================================================================
 // CommandQueueWrapper
@@ -1579,15 +1605,27 @@ public:
         const D3D12_CLEAR_VALUE* pOptimizedClearValue,
         REFIID riidResource, void** ppvResource) override
     {
-        return m_real->CreateCommittedResource(pHeapProperties, HeapFlags, pDesc,
-                                               InitialResourceState, pOptimizedClearValue,
-                                               riidResource, ppvResource);
+        HRESULT hr = m_real->CreateCommittedResource(pHeapProperties, HeapFlags, pDesc,
+                                                      InitialResourceState, pOptimizedClearValue,
+                                                      riidResource, ppvResource);
+        if (FAILED(hr) && pDesc)
+            D3DLogE("CreateCommittedResource FAILED: hr=0x%08x HeapFlags=0x%x "
+                    "Dim=%u W=%llu H=%u Fmt=%u ResFlags=0x%x",
+                    (UINT)hr, (UINT)HeapFlags,
+                    (UINT)pDesc->Dimension, pDesc->Width, pDesc->Height,
+                    (UINT)pDesc->Format, (UINT)pDesc->Flags);
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE CreateHeap(
         const D3D12_HEAP_DESC* pDesc, REFIID riid, void** ppvHeap) override
     {
-        return m_real->CreateHeap(pDesc, riid, ppvHeap);
+        HRESULT hr = m_real->CreateHeap(pDesc, riid, ppvHeap);
+        if (pDesc)
+            D3DLog("CreateHeap: size=%llu align=%llu flags=0x%x type=%u hr=0x%08x",
+                   pDesc->SizeInBytes, pDesc->Alignment,
+                   (UINT)pDesc->Flags, (UINT)pDesc->Properties.Type, (UINT)hr);
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(
@@ -1597,6 +1635,38 @@ public:
         const D3D12_CLEAR_VALUE* pOptimizedClearValue,
         REFIID riid, void** ppvResource) override
     {
+        // Convert ALL placed resources to committed to avoid DXMT placed-resource bugs.
+        if (pDesc) {
+            D3D12_HEAP_DESC heapDesc = {};
+            pHeap->GetDesc(&heapDesc);
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type                 = heapDesc.Properties.Type;
+            hp.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+            D3D12_RESOURCE_DESC desc = *pDesc;
+            // Textures as placed use ROW_MAJOR or 64KB_UNDEFINED_SWIZZLE;
+            // committed textures must use UNKNOWN.
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+                desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+            HRESULT hr = m_real->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &desc,
+                InitialState, pOptimizedClearValue, riid, ppvResource);
+            if (SUCCEEDED(hr)) {
+                static std::atomic<int> placedCount{0};
+                int n = placedCount.fetch_add(1);
+                if (n < 50) {
+                    D3DLog("Placed→Committed[%d]: heapType=%u dim=%u fmt=%u size=%llux%u offset=%llu state=0x%x",
+                        n, (unsigned)hp.Type, (unsigned)desc.Dimension, (unsigned)desc.Format,
+                        (unsigned long long)desc.Width, (unsigned)desc.Height,
+                        (unsigned long long)HeapOffset, (unsigned)InitialState);
+                }
+                return hr;
+            }
+            D3DLog("Placed→Committed FAILED hr=0x%08x dim=%u, falling back to placed",
+                (unsigned)hr, (unsigned)desc.Dimension);
+        }
         return m_real->CreatePlacedResource(pHeap, HeapOffset, pDesc,
                                             InitialState, pOptimizedClearValue,
                                             riid, ppvResource);
@@ -1705,8 +1775,17 @@ public:
         ID3D12RootSignature* pRootSignature,
         REFIID riid, void** ppvCommandSignature) override
     {
-        return m_real->CreateCommandSignature(pDesc, pRootSignature,
-                                              riid, ppvCommandSignature);
+        HRESULT hr = m_real->CreateCommandSignature(pDesc, pRootSignature, riid, ppvCommandSignature);
+        if (pDesc && SUCCEEDED(hr)) {
+            // Log each argument type in the signature
+            for (UINT i = 0; i < pDesc->NumArgumentDescs; i++) {
+                D3DLog("CreateCommandSignature: stride=%u arg[%u] type=%u ptr=%p",
+                    pDesc->ByteStride, i,
+                    (unsigned)pDesc->pArgumentDescs[i].Type,
+                    ppvCommandSignature ? *ppvCommandSignature : nullptr);
+            }
+        }
+        return hr;
     }
     void STDMETHODCALLTYPE GetResourceTiling(
         ID3D12Resource* pTiledResource,
@@ -1831,7 +1910,12 @@ public:
         ID3D12ProtectedResourceSession* pProtectedSession,
         REFIID riid, void** ppvHeap) override
     {
-        return m_real->CreateHeap1(pDesc, pProtectedSession, riid, ppvHeap);
+        HRESULT hr = m_real->CreateHeap1(pDesc, pProtectedSession, riid, ppvHeap);
+        if (pDesc)
+            D3DLog("CreateHeap1: size=%llu align=%llu flags=0x%x type=%u hr=0x%08x",
+                   pDesc->SizeInBytes, pDesc->Alignment,
+                   (UINT)pDesc->Flags, (UINT)pDesc->Properties.Type, (UINT)hr);
+        return hr;
     }
 
     // *** KEY OVERRIDE: CreateReservedResource1 → CreateCommittedResource ***
